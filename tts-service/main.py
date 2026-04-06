@@ -1,17 +1,19 @@
+hhh = "xfaZTQTAyii6fE4XZJhN4weeyW1E2mvi"
+
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import io
 import re
+import os
 import asyncio
 import threading
-
+import httpx 
 
 import torch
 from TTS.utils.synthesizer import Synthesizer
 import soundfile as sf
-
 
 try:
     from num2words import num2words
@@ -20,7 +22,6 @@ except Exception:
     HAS_NUM2WORDS = False
 
 app = FastAPI()
-
 
 ABBREV = {
     r'\bprof\.?\b': 'professore',
@@ -33,63 +34,48 @@ def _expand_number(match):
     s = match.group(0)
     if HAS_NUM2WORDS:
         try:
-            
             return num2words(int(s), lang='it')
         except Exception:
             return s
     return s
 
 def normalize_text(text: str) -> str:
+    if not text: return ""
+    t = text.strip().lower()
     
-    if text is None:
-        return ""
-    t = text.strip()
-    if t == "":
-        return t
-    
-    # add leading comma+space if not present (user request)
-    # if not t.startswith(", "):
-    #     t = ", " + t
-
-    # lowercase
-    t = t.lower()
-    # expand simple abbreviations
     for pat, repl in ABBREV.items():
         t = re.sub(pat, repl, t)
-    # expand integers
     t = re.sub(r'\d+', _expand_number, t)
-    # normalize whitespace
     t = re.sub(r'\s+', ' ', t)
-    # small punctuation fixes
-    t = t.replace(" ,", ",")
-    t = t.replace(": ", ", ")
+    t = t.replace(" ,", ",").replace(": ", ", ")
     
-
-    # a bit of hardcoded english spelling parsing
     t = re.sub(r"cha", "cia", t)
     t = re.sub(r"cho", "cio", t)
     t = re.sub(r"chu", "ciu", t)
     return t
 
-
+# --- LOCAL TTS SETUP (Coqui VITS) ---
 model_checkpoint_path = "best_model.pth"
 config_path = "config.json"
-
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Starting TTS on device: {device}")
 
-synthesizer = Synthesizer(
-    tts_checkpoint=model_checkpoint_path,
-    tts_config_path=config_path,
-    use_cuda=torch.cuda.is_available(),
-)
+try:
+    print(f"Starting Local TTS on device: {device}")
+    synthesizer = Synthesizer(
+        tts_checkpoint=model_checkpoint_path,
+        tts_config_path=config_path,
+        use_cuda=torch.cuda.is_available(),
+    )
+    SAMPLE_RATE = synthesizer.output_sample_rate
+    synth_lock = threading.Lock()
+    LOCAL_TTS_READY = True
+except Exception as e:
+    print(f"Local TTS could not be loaded: {e}")
+    LOCAL_TTS_READY = False
 
-SAMPLE_RATE = synthesizer.output_sample_rate
-
-synth_lock = threading.Lock()
-
-async def synthesize_wav_bytes(normalized_text: str) -> io.BytesIO:
-    """Run blocking synthesizer in a thread and return a BytesIO WAV buffer."""
+async def synthesize_local(normalized_text: str) -> io.BytesIO:
+    if not LOCAL_TTS_READY:
+        raise HTTPException(status_code=500, detail="Local TTS model is not available.")
     def _do_synth(text_in):
         with synth_lock:
             wav = synthesizer.tts(text=text_in, language_name='it')
@@ -97,30 +83,58 @@ async def synthesize_wav_bytes(normalized_text: str) -> io.BytesIO:
         sf.write(buf, wav, SAMPLE_RATE, format='WAV')
         buf.seek(0)
         return buf
+    return await asyncio.to_thread(_do_synth, normalized_text)
 
-    buf = await asyncio.to_thread(_do_synth, normalized_text)
-    return buf
+# --- MISTRAL VOXTRAL API SETUP ---
+async def synthesize_voxtral(text: str, voice_id: str) -> io.BytesIO:
+    api_key = os.getenv("MISTRAL_API_KEY", hhh)
+    if not api_key:
+        raise HTTPException(status_code=500, detail="MISTRAL_API_KEY environment variable not set")
 
+    async with httpx.AsyncClient() as client:
+        # Calls the Voxtral endpoint. model: voxtral-mini-tts-2603
+        response = await client.post(
+            "https://api.mistral.ai/v1/audio/speech",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": "voxtral-mini-tts-2603",
+                "input": text,
+                "voice": voice_id,          # Standard or Cloned voice_id
+                "response_format": "wav" 
+            },
+            timeout=30.0
+        )
+        
+        if response.status_code != 200:
+            raise HTTPException(status_code=response.status_code, detail=f"Mistral API Error: {response.text}")
+            
+        # Mistral returns the raw audio file directly
+        buf = io.BytesIO(response.content)
+        return buf
 
+# --- ENDPOINTS ---
 @app.post("/normalize")
 async def normalize_endpoint(request: Request):
     data = await request.json()
     text = data.get("text", "")
-    normalized = normalize_text(text)
-    return JSONResponse({"original": text, "normalized": normalized})
+    return JSONResponse({"original": text, "normalized": normalize_text(text)})
 
 @app.post("/tts")
 async def tts_endpoint(request: Request):
     data = await request.json()
     text = data.get("text", "")
-    if not text or not text.strip():
+    provider = data.get("provider", "local") # "local" or "voxtral"
+    voice_id = data.get("voice_id", "preset-1") # Use Mistral Studio to get custom IDs
+    
+    if not text.strip():
         raise HTTPException(status_code=400, detail="No text provided")
 
-    # 1) normalize first (use same function as /normalize)
     normalized = normalize_text(text)
 
-    # 2) synthesize normalized text (offloaded to thread)
-    wav_buf = await synthesize_wav_bytes(normalized)
+    if provider == "voxtral":
+        wav_buf = await synthesize_voxtral(normalized, voice_id)
+    else:
+        wav_buf = await synthesize_local(normalized)
 
     return StreamingResponse(
         wav_buf,
@@ -128,4 +142,4 @@ async def tts_endpoint(request: Request):
         headers={"Content-Disposition": "inline; filename=output.wav"}
     )
 
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
+# app.mount("/", StaticFiles(directory="static", html=True), name="static")

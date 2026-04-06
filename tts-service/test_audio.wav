@@ -1,0 +1,1 @@
+{"detail":"Mistral API Error: {\"object\":\"error\",\"message\":\"Voice 'preset-1' not found.\",\"type\":\"invalid_voice\",\"param\":null,\"code\":\"1902\",\"raw_status_code\":404}"}

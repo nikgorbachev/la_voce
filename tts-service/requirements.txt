@@ -1,5 +1,9 @@
 fastapi
+torch 
+torchaudio
+torchcodec
 coqui-tts
 uvicorn 
 soundfile 
 num2words
+httpx
