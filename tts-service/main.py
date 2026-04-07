@@ -1,6 +1,3 @@
-hhh = "xfaZTQTAyii6fE4XZJhN4weeyW1E2mvi"
-
-
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -10,10 +7,13 @@ import os
 import asyncio
 import threading
 import httpx 
-
+import base64
+from dotenv import load_dotenv
 import torch
 from TTS.utils.synthesizer import Synthesizer
 import soundfile as sf
+
+load_dotenv()
 
 try:
     from num2words import num2words
@@ -55,8 +55,8 @@ def normalize_text(text: str) -> str:
     return t
 
 # --- LOCAL TTS SETUP (Coqui VITS) ---
-model_checkpoint_path = "best_model.pth"
-config_path = "config.json"
+model_checkpoint_path = "models/best_model.pth"
+config_path = "models/config.json"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 try:
@@ -85,21 +85,20 @@ async def synthesize_local(normalized_text: str) -> io.BytesIO:
         return buf
     return await asyncio.to_thread(_do_synth, normalized_text)
 
-# --- MISTRAL VOXTRAL API SETUP ---
+
 async def synthesize_voxtral(text: str, voice_id: str) -> io.BytesIO:
-    api_key = os.getenv("MISTRAL_API_KEY", hhh)
+    api_key = os.getenv("MISTRAL_API_KEY") 
     if not api_key:
         raise HTTPException(status_code=500, detail="MISTRAL_API_KEY environment variable not set")
 
     async with httpx.AsyncClient() as client:
-        # Calls the Voxtral endpoint. model: voxtral-mini-tts-2603
         response = await client.post(
             "https://api.mistral.ai/v1/audio/speech",
             headers={"Authorization": f"Bearer {api_key}"},
             json={
                 "model": "voxtral-mini-tts-2603",
                 "input": text,
-                "voice": voice_id,          # Standard or Cloned voice_id
+                "voice_id": voice_id,       
                 "response_format": "wav" 
             },
             timeout=30.0
@@ -108,9 +107,15 @@ async def synthesize_voxtral(text: str, voice_id: str) -> io.BytesIO:
         if response.status_code != 200:
             raise HTTPException(status_code=response.status_code, detail=f"Mistral API Error: {response.text}")
             
-        # Mistral returns the raw audio file directly
-        buf = io.BytesIO(response.content)
-        return buf
+        # Mistral returns JSON containing a base64 encoded audio string
+        data = response.json()
+        audio_b64 = data.get("audio_data", "")
+        
+        # Decode the string back into actual binary audio bytes
+        audio_bytes = base64.b64decode(audio_b64)
+        return io.BytesIO(audio_bytes)
+    
+
 
 # --- ENDPOINTS ---
 @app.post("/normalize")
@@ -123,8 +128,8 @@ async def normalize_endpoint(request: Request):
 async def tts_endpoint(request: Request):
     data = await request.json()
     text = data.get("text", "")
-    provider = data.get("provider", "local") # "local" or "voxtral"
-    voice_id = data.get("voice_id", "preset-1") # Use Mistral Studio to get custom IDs
+    provider = data.get("provider", "local") 
+    voice_id = data.get("voice_id", "c6fdbd50-6da9-45d4-8954-cb5b7b49eca1") 
     
     if not text.strip():
         raise HTTPException(status_code=400, detail="No text provided")
