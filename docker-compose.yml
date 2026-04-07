@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  tts:
+    build: 
+      context: ./tts-service
+    container_name: la_voce_tts
+    ports:
+      - "8000:8000"
+    environment:
+      # If you are using local models, you can map volumes here later
+    # volumes:
+    #   - ./tts-service/best_model.pth:/app/best_model.pth
+
+  backend:
+    build:
+      context: ./backend-api
+    container_name: la_voce_backend
+    ports:
+      - "8080:8080"
+    depends_on:
+      - tts

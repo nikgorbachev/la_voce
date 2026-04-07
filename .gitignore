@@ -1,3 +1,6 @@
 *__pycache__*
 *.pth*
 *.venv/
+tts-service/models/
+.env
+*.wav
